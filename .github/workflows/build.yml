@@ -1,0 +1,594 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write project files
+        run: |
+          rm -rf app src *.gradle *.gradle.kts gradle.properties
+          mkdir -p app app/src/main app/src/main/java/com/turbo/tapper app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle <<'EOF0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TurboTapper"
+          include ':app'
+          EOF0
+          cat > build.gradle <<'EOF1'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF1
+          cat > app/build.gradle <<'EOF2'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.turbo.tapper'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.turbo.tapper'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF2
+          cat > app/src/main/AndroidManifest.xml <<'EOF3'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".TapService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/acc" />
+                  </service>
+              </application>
+          </manifest>
+          EOF3
+          cat > app/src/main/res/xml/acc.xml <<'EOF4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRequestFilterKeyEvents"
+              android:canPerformGestures="true"
+              android:canRequestFilterKeyEvents="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100" />
+          EOF4
+          cat > app/src/main/res/values/strings.xml <<'EOF5'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Turbo Tapper</string>
+              <string name="acc_desc">Taps the red dot automatically. Use the floating START / STOP button. Volume key also stops.</string>
+          </resources>
+          EOF5
+          cat > app/src/main/java/com/turbo/tapper/TapService.java <<'EOF6'
+          package com.turbo.tapper;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.accessibilityservice.GestureDescription;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.Path;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.view.Gravity;
+          import android.view.KeyEvent;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.widget.Button;
+          import android.widget.Toast;
+
+          public class TapService extends AccessibilityService {
+
+              private static final int GREEN = 0xCC006600;
+              private static final int RED = 0xCCAA0000;
+
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private WindowManager wm;
+              private View dot;
+              private Button btn;
+              private WindowManager.LayoutParams dotLp;
+              private WindowManager.LayoutParams btnLp;
+
+              private boolean running = false;
+              private GestureDescription gesture;
+              private int burst = 1;
+              private int pause = 0;
+              private int goal = 0;
+              private long startTime = 0;
+              private long taps = 0;
+              private long lastTaps = 0;
+              private long lastTime = 0;
+
+              private final Runnable loop = new Runnable() {
+                  @Override
+                  public void run() {
+                      fire();
+                  }
+              };
+
+              private final Runnable autoStop = new Runnable() {
+                  @Override
+                  public void run() {
+                      stopTapping();
+                  }
+              };
+
+              // Updates the STOP button with the real taps-per-second every 0.5 s.
+              private final Runnable ticker = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!running || btn == null) return;
+                      long now = SystemClock.uptimeMillis();
+                      long rate = (taps - lastTaps) * 1000L / Math.max(1L, now - lastTime);
+                      lastTaps = taps;
+                      lastTime = now;
+                      btn.setText("STOP\n" + rate + "/s\n" + fmt(taps));
+                      h.postDelayed(this, 500);
+                  }
+              };
+
+              private final AccessibilityService.GestureResultCallback cb =
+                      new AccessibilityService.GestureResultCallback() {
+                          @Override
+                          public void onCompleted(GestureDescription g) {
+                              taps += burst;
+                              if (goal > 0 && taps >= goal) {
+                                  stopTapping();
+                                  return;
+                              }
+                              next(0);
+                          }
+
+                          @Override
+                          public void onCancelled(GestureDescription g) {
+                              next(10);
+                          }
+                      };
+
+              // ---------------------------------------------------------------- lifecycle
+
+              @Override
+              protected void onServiceConnected() {
+                  super.onServiceConnected();
+                  cleanup();
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+                  // Red dot = where the taps land.
+                  dot = new View(this);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setShape(GradientDrawable.OVAL);
+                  g.setColor(0x88FF0000);
+                  g.setStroke(dp(3), Color.WHITE);
+                  dot.setBackground(g);
+                  dotLp = lp(dp(56), dp(56), dp(140), dp(320));
+                  draggable(dot, dotLp, false);
+                  wm.addView(dot, dotLp);
+
+                  // START / STOP button.
+                  btn = new Button(this);
+                  btn.setTextColor(Color.WHITE);
+                  btn.setTextSize(12);
+                  btn.setPadding(0, 0, 0, 0);
+                  showIdle();
+                  btnLp = lp(dp(96), dp(68), dp(16), dp(140));
+                  draggable(btn, btnLp, true);
+                  wm.addView(btn, btnLp);
+              }
+
+              @Override
+              public boolean onUnbind(Intent intent) {
+                  cleanup();
+                  return super.onUnbind(intent);
+              }
+
+              @Override
+              public void onDestroy() {
+                  cleanup();
+                  super.onDestroy();
+              }
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+              }
+
+              @Override
+              public void onInterrupt() {
+                  stopTapping();
+              }
+
+              // Any volume key stops tapping (only while running, otherwise normal volume).
+              @Override
+              protected boolean onKeyEvent(KeyEvent event) {
+                  int k = event.getKeyCode();
+                  if (running && (k == KeyEvent.KEYCODE_VOLUME_DOWN || k == KeyEvent.KEYCODE_VOLUME_UP)) {
+                      if (event.getAction() == KeyEvent.ACTION_DOWN) stopTapping();
+                      return true;
+                  }
+                  return super.onKeyEvent(event);
+              }
+
+              // ---------------------------------------------------------------- start / stop
+
+              private void startTapping() {
+                  if (running || dot == null || btn == null) return;
+
+                  SharedPreferences sp = getSharedPreferences("turbo", MODE_PRIVATE);
+                  burst = clamp(sp.getInt("burst", 20), 1, GestureDescription.getMaxStrokeCount());
+                  int gap = clamp(sp.getInt("gap", 0), 0, 100);
+                  pause = clamp(sp.getInt("pause", 0), 0, 5000);
+                  int limit = clamp(sp.getInt("limit", 0), 0, 86400);
+                  goal = clamp(sp.getInt("goal", 200000), 0, 100000000);
+
+                  // Real on-screen centre of the dot.
+                  int[] d = new int[2];
+                  dot.getLocationOnScreen(d);
+                  float tx = d[0] + dot.getWidth() / 2f;
+                  float ty = d[1] + dot.getHeight() / 2f;
+
+                  // Do not let the taps hit our own START/STOP button.
+                  int[] b = new int[2];
+                  btn.getLocationOnScreen(b);
+                  Rect r = new Rect(b[0], b[1], b[0] + btn.getWidth(), b[1] + btn.getHeight());
+                  r.inset(-dp(16), -dp(16));
+                  if (r.contains((int) tx, (int) ty)) {
+                      Toast.makeText(this, "Red dot ko button se door rakho", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+
+                  // One gesture = 'burst' taps, 'gap' ms apart (gap 0 = all at once, multi-touch). Built once, reused.
+                  Path path = new Path();
+                  path.moveTo(tx, ty);
+                  GestureDescription.Builder gb = new GestureDescription.Builder();
+                  for (int i = 0; i < burst; i++) {
+                      gb.addStroke(new GestureDescription.StrokeDescription(path, (long) i * gap, 1L));
+                  }
+                  gesture = gb.build();
+
+                  running = true;
+                  taps = 0;
+                  lastTaps = 0;
+                  lastTime = SystemClock.uptimeMillis();
+                  startTime = lastTime;
+
+                  // Taps pass straight through the dot while running.
+                  dotLp.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+                  update(dot, dotLp);
+                  btn.setText("STOP");
+                  btn.setBackgroundColor(RED);
+
+                  h.post(loop);
+                  h.postDelayed(ticker, 500);
+                  if (limit > 0) h.postDelayed(autoStop, limit * 1000L);
+              }
+
+              private void stopTapping() {
+                  boolean was = running;
+                  running = false;
+                  h.removeCallbacksAndMessages(null);
+                  if (dot != null) {
+                      dotLp.flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+                      update(dot, dotLp);
+                  }
+                  if (btn != null) showIdle();
+                  if (was && taps > 0) {
+                      long ms = Math.max(1L, SystemClock.uptimeMillis() - startTime);
+                      Toast.makeText(this, "Done: " + taps + " taps, avg " + (taps * 1000L / ms) + "/s, " + (ms / 1000) + " s", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private static String fmt(long n) {
+                  if (n < 1000) return String.valueOf(n);
+                  return (n / 100) / 10.0 + "k";
+              }
+
+              private void showIdle() {
+                  btn.setText("START");
+                  btn.setBackgroundColor(GREEN);
+              }
+
+              // ---------------------------------------------------------------- tap loop
+
+              private void fire() {
+                  if (!running || gesture == null) return;
+                  boolean ok = false;
+                  try {
+                      ok = dispatchGesture(gesture, cb, null);
+                  } catch (Exception ignored) {
+                  }
+                  if (!ok) h.postDelayed(loop, 50);
+              }
+
+              private void next(long extra) {
+                  if (!running) return;
+                  long delay = pause + extra;
+                  if (delay > 0) h.postDelayed(loop, delay);
+                  else h.post(loop);
+              }
+
+              // ---------------------------------------------------------------- overlay helpers
+
+              private WindowManager.LayoutParams lp(int w, int hh, int x, int y) {
+                  WindowManager.LayoutParams p = new WindowManager.LayoutParams(
+                          w, hh,
+                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT);
+                  p.gravity = Gravity.TOP | Gravity.LEFT;
+                  p.x = x;
+                  p.y = y;
+                  return p;
+              }
+
+              private void update(View v, WindowManager.LayoutParams p) {
+                  try {
+                      wm.updateViewLayout(v, p);
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              // Drag to move. On the button: while running, STOP fires instantly on touch-DOWN.
+              private void draggable(final View v, final WindowManager.LayoutParams p, final boolean isButton) {
+                  v.setOnTouchListener(new View.OnTouchListener() {
+                      float downX, downY;
+                      int startX, startY;
+                      boolean moved, ignore;
+
+                      @Override
+                      public boolean onTouch(View view, MotionEvent e) {
+                          switch (e.getActionMasked()) {
+                              case MotionEvent.ACTION_DOWN: {
+                                  downX = e.getRawX();
+                                  downY = e.getRawY();
+                                  startX = p.x;
+                                  startY = p.y;
+                                  moved = false;
+                                  ignore = false;
+                                  if (isButton && running) {
+                                      ignore = true;
+                                      stopTapping();
+                                  }
+                                  return true;
+                              }
+                              case MotionEvent.ACTION_MOVE: {
+                                  if (ignore) return true;
+                                  float dx = e.getRawX() - downX;
+                                  float dy = e.getRawY() - downY;
+                                  if (Math.abs(dx) > dp(6) || Math.abs(dy) > dp(6)) moved = true;
+                                  if (moved) {
+                                      p.x = startX + (int) dx;
+                                      p.y = startY + (int) dy;
+                                      update(v, p);
+                                  }
+                                  return true;
+                              }
+                              case MotionEvent.ACTION_UP: {
+                                  if (isButton && !ignore && !moved) startTapping();
+                                  return true;
+                              }
+                              default:
+                                  return true;
+                          }
+                      }
+                  });
+              }
+
+              private void cleanup() {
+                  running = false;
+                  h.removeCallbacksAndMessages(null);
+                  try {
+                      if (wm != null && dot != null) wm.removeView(dot);
+                  } catch (Exception ignored) {
+                  }
+                  try {
+                      if (wm != null && btn != null) wm.removeView(btn);
+                  } catch (Exception ignored) {
+                  }
+                  dot = null;
+                  btn = null;
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private static int clamp(int v, int lo, int hi) {
+                  return Math.max(lo, Math.min(hi, v));
+              }
+          }
+          EOF6
+          cat > app/src/main/java/com/turbo/tapper/MainActivity.java <<'EOF7'
+          package com.turbo.tapper;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.util.LinkedHashMap;
+          import java.util.Map;
+
+          public class MainActivity extends Activity {
+
+              private SharedPreferences sp;
+              private LinearLayout root;
+              private final Map<String, EditText> fields = new LinkedHashMap<>();
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  sp = getSharedPreferences("turbo", MODE_PRIVATE);
+
+                  ScrollView sv = new ScrollView(this);
+                  root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int pad = dp(20);
+                  root.setPadding(pad, pad, pad, pad);
+                  sv.addView(root);
+                  setContentView(sv);
+
+                  TextView title = new TextView(this);
+                  title.setText("Turbo Tapper");
+                  title.setTextSize(26);
+                  root.addView(title);
+
+                  Button open = new Button(this);
+                  open.setText("1) OPEN ACCESSIBILITY SETTINGS");
+                  open.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                      }
+                  });
+                  addView(open, 16);
+
+                  field("Taps per burst (1-20)", "burst", 20);
+                  field("Gap between taps in a burst (ms, 0 = all at once)", "gap", 0);
+                  field("Pause between bursts (ms, 0 = none)", "pause", 0);
+                  field("Stop after this many taps (0 = never)", "goal", 200000);
+                  field("Stop after seconds (0 = never)", "limit", 0);
+
+                  Button save = new Button(this);
+                  save.setText("2) SAVE");
+                  save.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          save();
+                      }
+                  });
+                  addView(save, 16);
+
+                  TextView help = new TextView(this);
+                  help.setText(
+                          "Steps:\n"
+                          + "1) Accessibility > Downloaded apps > Turbo Tapper ON karo.\n"
+                          + "2) Screen pe START button aur laal dot aayega.\n"
+                          + "3) Laal dot ko drag karke target jagah rakho (button se door).\n"
+                          + "4) START dabao. Button pe live taps/sec dikhega.\n\n"
+                          + "Rokne ke 3 tareeke:\n"
+                          + "- STOP button (touch karte hi ruk jata hai)\n"
+                          + "- Volume Up ya Volume Down key\n"
+                          + "- Accessibility me Turbo Tapper OFF\n\n"
+                          + "Speed test (10 sec chalao, app ka apna counter dekho):\n"
+                          + "- gap 0 = 20 taps ek saath (multi-touch), sabse tez. Har app ise count nahi karta.\n"
+                          + "- gap 2 = 20 taps ek ke baad ek, sab apps count karte hain par dhimi.\n"
+                          + "STOP hone par toast me total taps aur avg/sec aata hai.\n"
+                          + "Settings badalne ke baad SAVE dabao, phir START karo.");
+                  addView(help, 20);
+              }
+
+              private void field(String label, String key, int def) {
+                  TextView t = new TextView(this);
+                  t.setText(label);
+                  addView(t, 14);
+                  EditText e = new EditText(this);
+                  e.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  e.setText(String.valueOf(sp.getInt(key, def)));
+                  addView(e, 0);
+                  fields.put(key, e);
+              }
+
+              private void save() {
+                  SharedPreferences.Editor ed = sp.edit();
+                  for (Map.Entry<String, EditText> en : fields.entrySet()) {
+                      int v = 0;
+                      try {
+                          v = Integer.parseInt(en.getValue().getText().toString().trim());
+                      } catch (Exception ignored) {
+                      }
+                      ed.putInt(en.getKey(), v);
+                  }
+                  ed.apply();
+                  Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show();
+              }
+
+              private void addView(View v, int topDp) {
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.topMargin = dp(topDp);
+                  root.addView(v, lp);
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+          }
+          EOF7
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TurboTapper
+          path: app/build/outputs/apk/debug/app-debug.apk
